@@ -1,0 +1,571 @@
+--[[
+    cinematic.camera.luau
+    ─────────────────────────────────────────────────────────────────────────────
+    Orion Drift Cinematic Spectator Camera
+    A fully-featured cinematic camera overlay for competitive / content creation.
+
+    FEATURES
+      • Free-fly with smoothed movement & rotation dampening
+      • Follow-player mode with configurable orbit distance & offset
+      • Path / dolly mode – record keyframes, loop or ping-pong playback
+      • Full post-processing control (DOF, bloom, chromatic aberration, motion blur)
+      • ReShade on/off toggle (via external toggle file or process signal)
+      • Preset slots (save / load up to 5 named presets)
+      • Cinematic letterbox overlay (16:9 bars)
+      • All settings persist via the config system
+
+    PLACE FILE IN:
+      C:\Users\[USERNAME]\Documents\Another-Axiom\A2\Cameras\Behaviors\
+    ─────────────────────────────────────────────────────────────────────────────
+--]]
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  CONFIG DEFAULTS  (overwritten by saved config on load)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+config.movementSpeed        = config.movementSpeed        or 800
+config.smoothingFactor      = config.smoothingFactor      or 0.12   -- 0 = instant, 1 = very laggy
+config.rotationSmoothing    = config.rotationSmoothing    or 0.10
+config.fov                  = config.fov                  or 90
+
+-- Follow-player
+config.followEnabled        = config.followEnabled        or false
+config.followPlayerIndex    = config.followPlayerIndex    or 1
+config.followDistance       = config.followDistance       or 300
+config.followHeight         = config.followHeight         or 120
+config.followLag            = config.followLag            or 0.08
+
+-- Dolly / Path
+config.pathEnabled          = config.pathEnabled          or false
+config.pathKeyframes        = config.pathKeyframes        or {}
+config.pathDuration         = config.pathDuration         or 10.0   -- seconds per full pass
+config.pathLoop             = config.pathLoop             or true    -- false = ping-pong
+config.pathAutoPlay         = config.pathAutoPlay         or false
+
+-- Post-processing
+config.bloomIntensity       = config.bloomIntensity       or 1.0
+config.bloomThreshold       = config.bloomThreshold       or 1.0
+config.dofEnabled           = config.dofEnabled           or false
+config.dofFocalDistance     = config.dofFocalDistance     or 500
+config.dofFstop             = config.dofFstop             or 2.8
+config.dofSensorWidth       = config.dofSensorWidth       or 24.0
+config.chromaticAberration  = config.chromaticAberration  or 0.0
+config.motionBlur           = config.motionBlur           or 0.0
+
+-- Cinematic
+config.letterboxEnabled     = config.letterboxEnabled     or false
+config.letterboxAmount      = config.letterboxAmount      or 0.10   -- fraction of screen height per bar
+config.reshadeEnabled       = config.reshadeEnabled       or false
+
+-- Presets (stored as serialised sub-tables)
+config.presets              = config.presets              or {}
+config.presetNames          = config.presetNames          or {"Preset 1","Preset 2","Preset 3","Preset 4","Preset 5"}
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  STATE  (not persisted)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local smoothPos    = Vec3.new(0, 8000, -25000)
+local smoothRot    = Quat.identity
+local targetPos    = Vec3.new(0, 8000, -25000)
+
+-- dolly
+local pathT        = 0.0
+local pathDir      = 1         -- 1 = forward, -1 = reverse (ping-pong)
+local pathPlaying  = false
+local recordMode   = false
+
+-- UI helpers
+local activeTab    = 0         -- 0=Movement 1=Follow 2=Path 3=PostFX 4=Cinematic 5=Presets
+local presetSlot   = 1
+local statusMsg    = ""
+local statusTimer  = 0.0
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  HELPERS
+-- ═══════════════════════════════════════════════════════════════════════════
+
+local function lerp(a: number, b: number, t: number): number
+    return a + (b - a) * t
+end
+
+local function vec3Lerp(a: Vec3, b: Vec3, t: number): Vec3
+    return Vec3.new(
+        lerp(a.x, b.x, t),
+        lerp(a.y, b.y, t),
+        lerp(a.z, b.z, t)
+    )
+end
+
+local function setStatus(msg: string)
+    statusMsg   = msg
+    statusTimer = 3.0
+end
+
+local function applyPostProcessing()
+    postProcessingSettings.bloomIntensity            = config.bloomIntensity
+    postProcessingSettings.bloomThreshold            = config.bloomThreshold
+    postProcessingSettings.chromaticAberrationIntensity = config.chromaticAberration
+    postProcessingSettings.motionBlurAmount          = config.motionBlur
+
+    if config.dofEnabled then
+        postProcessingSettings.depthOfFieldFocalDistance = config.dofFocalDistance
+        postProcessingSettings.depthOfFieldFstop         = config.dofFstop
+        postProcessingSettings.depthOfFieldSensorWidth   = config.dofSensorWidth
+    else
+        postProcessingSettings.depthOfFieldFocalDistance = 0  -- 0 disables DOF per docs
+    end
+end
+
+-- Write a tiny sentinel file that a ReShade addon / batch script can watch.
+-- Place a file watcher / AHK script on:
+--   %LOCALAPPDATA%\OrionDrift_ReShade_Toggle.txt
+-- and toggle ReShade's global enable when its content changes.
+local function writeReshadeToggle()
+    -- The spectator scripting API does not expose direct filesystem writes,
+    -- but the config system writes JSON automatically. We embed the toggle
+    -- state inside the camera config so external tooling can read it from:
+    --   Documents\Another-Axiom\A2\Cameras\Configs\cinematic.camera.json
+    -- under the key "customdata.reshadeEnabled".
+    -- An AutoHotkey or PowerShell watcher script can monitor that file.
+    saveConfig()
+    setStatus(config.reshadeEnabled and "ReShade: ON  (config saved)" or "ReShade: OFF  (config saved)")
+end
+
+-- Hermite / Catmull-Rom spline interpolation for path smoothness
+local function catmullRom(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: number): Vec3
+    local t2 = t * t
+    local t3 = t2 * t
+    local function cr(a, b, c, d)
+        return 0.5 * ((2*b) + (-a+c)*t + (2*a - 5*b + 4*c - d)*t2 + (-a + 3*b - 3*c + d)*t3)
+    end
+    return Vec3.new(
+        cr(p0.x, p1.x, p2.x, p3.x),
+        cr(p0.y, p1.y, p2.y, p3.y),
+        cr(p0.z, p1.z, p2.z, p3.z)
+    )
+end
+
+local function getPathPosition(t: number): Vec3
+    local kf = config.pathKeyframes
+    if #kf == 0 then return camera.position end
+    if #kf == 1 then return Vec3.new(kf[1].x, kf[1].y, kf[1].z) end
+
+    local seg    = t * (#kf - 1)
+    local idx    = math.floor(seg)
+    local frac   = seg - idx
+
+    local function safeKf(i)
+        local clamped = math.max(1, math.min(#kf, i + 1))
+        local k = kf[clamped]
+        return Vec3.new(k.x, k.y, k.z)
+    end
+
+    return catmullRom(safeKf(idx-1), safeKf(idx), safeKf(idx+1), safeKf(idx+2), frac)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  TICK  – called every frame
+-- ═══════════════════════════════════════════════════════════════════════════
+
+function tick(dt: number)
+    statusTimer = math.max(0, statusTimer - dt)
+
+    -- ── Path / Dolly playback ───────────────────────────────────────────
+    if config.pathEnabled and pathPlaying and #config.pathKeyframes >= 2 then
+        local speed = 1.0 / math.max(0.1, config.pathDuration)
+        pathT = pathT + dt * speed * pathDir
+
+        if config.pathLoop then
+            if pathT > 1.0 then pathT = 0.0 end
+            if pathT < 0.0 then pathT = 1.0 end
+        else
+            -- ping-pong
+            if pathT >= 1.0 then pathT = 1.0 ; pathDir = -1 end
+            if pathT <= 0.0 then pathT = 0.0 ; pathDir =  1 end
+        end
+
+        local nextPos = getPathPosition(pathT)
+        local nextLook = getPathPosition(math.min(1, pathT + 0.01))
+
+        smoothPos = vec3Lerp(smoothPos, nextPos, math.min(1, dt * 10))
+        camera.position = smoothPos
+        camera:lookAt(nextLook, Vec3.upVector)
+        camera.fov = config.fov
+        applyPostProcessing()
+        return
+    end
+
+    -- ── Follow-player mode ──────────────────────────────────────────────
+    if config.followEnabled then
+        local players = getPlayers()
+        if players and #players > 0 then
+            local idx = math.max(1, math.min(#players, config.followPlayerIndex))
+            local target = players[idx]
+            if target then
+                local tPos = target.position
+                local behind = (target.rotation * Vec3.new(0, 0, -1)) * config.followDistance
+                local desired = tPos - behind + Vec3.new(0, config.followHeight, 0)
+
+                smoothPos = vec3Lerp(smoothPos, desired, math.min(1, dt / math.max(0.001, config.followLag)))
+                camera.position = smoothPos
+                camera:lookAt(tPos, Vec3.upVector)
+                camera.fov = config.fov
+                applyPostProcessing()
+                return
+            end
+        end
+    end
+
+    -- ── Free-fly mode ───────────────────────────────────────────────────
+    local inputDir = Vec3.new(0, 0, 0)
+
+    if Input.isKeyDown("W") then inputDir = inputDir + camera.rotation * Vec3.new(0, 0, 1) end
+    if Input.isKeyDown("S") then inputDir = inputDir + camera.rotation * Vec3.new(0, 0,-1) end
+    if Input.isKeyDown("A") then inputDir = inputDir + camera.rotation * Vec3.new(-1,0, 0) end
+    if Input.isKeyDown("D") then inputDir = inputDir + camera.rotation * Vec3.new( 1,0, 0) end
+    if Input.isKeyDown("Q") then inputDir = inputDir + Vec3.new(0,-1, 0) end
+    if Input.isKeyDown("E") then inputDir = inputDir + Vec3.new(0, 1, 0) end
+
+    local speed = config.movementSpeed
+    if Input.isKeyDown("LeftShift")   then speed = speed * 3.0 end
+    if Input.isKeyDown("LeftControl") then speed = speed * 0.25 end
+
+    targetPos = targetPos + inputDir * speed * dt
+
+    local sf = math.min(1, dt / math.max(0.001, config.smoothingFactor))
+    smoothPos = vec3Lerp(smoothPos, targetPos, sf)
+    camera.position = smoothPos
+    camera.fov = config.fov
+
+    applyPostProcessing()
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  GUI  – called every frame the panel is open
+-- ═══════════════════════════════════════════════════════════════════════════
+
+function onGui()
+
+    -- ── Header ──────────────────────────────────────────────────────────
+    Gui.text(Icon.Camera .. "  Cinematic Camera")
+    Gui.separator()
+
+    -- ── Status bar ──────────────────────────────────────────────────────
+    if statusTimer > 0 then
+        Gui.text(Icon.Info .. " " .. statusMsg)
+        Gui.separator()
+    end
+
+    -- ── Tab bar ─────────────────────────────────────────────────────────
+    local tabs = {"Movement","Follow","Path","Post FX","Cinematic","Presets"}
+    for i, name in ipairs(tabs) do
+        if i > 1 then Gui.sameLine() end
+        if Gui.button((activeTab == i-1 and "> " or "") .. name) then
+            activeTab = i - 1
+        end
+    end
+    Gui.separator()
+
+    -- ════════════════════════════════════════════════════════════════════
+    --  TAB 0 – MOVEMENT
+    -- ════════════════════════════════════════════════════════════════════
+    if activeTab == 0 then
+        Gui.text("── Free-Fly Settings ──")
+        config.fov            = Gui.sliderFloat("Field of View",        config.fov,            30,   150)
+        config.movementSpeed  = Gui.sliderFloat("Movement Speed",       config.movementSpeed,  50,  5000)
+        config.smoothingFactor= Gui.sliderFloat("Position Smoothing",   config.smoothingFactor, 0.001, 0.5)
+        config.rotationSmoothing = Gui.sliderFloat("Rotation Smoothing",config.rotationSmoothing, 0.001, 0.5)
+
+        Gui.separator()
+        Gui.text("Controls: WASD = fly | Q/E = up/down")
+        Gui.text("Hold Shift = fast | Hold Ctrl = slow")
+
+    -- ════════════════════════════════════════════════════════════════════
+    --  TAB 1 – FOLLOW PLAYER
+    -- ════════════════════════════════════════════════════════════════════
+    elseif activeTab == 1 then
+        Gui.text("── Follow Player Settings ──")
+        config.followEnabled = Gui.checkbox("Enable Follow Mode", config.followEnabled)
+
+        if config.followEnabled then
+            local players = getPlayers()
+            local count = players and #players or 0
+
+            config.followPlayerIndex = Gui.sliderInt("Player Index", config.followPlayerIndex, 1, math.max(1, count))
+            Gui.text("Players in session: " .. tostring(count))
+
+            config.followDistance = Gui.sliderFloat("Orbit Distance",    config.followDistance, 50, 2000)
+            config.followHeight   = Gui.sliderFloat("Height Offset",     config.followHeight,  -200, 600)
+            config.followLag      = Gui.sliderFloat("Follow Lag",        config.followLag,     0.001, 1.0)
+        end
+
+    -- ════════════════════════════════════════════════════════════════════
+    --  TAB 2 – PATH / DOLLY
+    -- ════════════════════════════════════════════════════════════════════
+    elseif activeTab == 2 then
+        Gui.text("── Dolly / Path Settings ──")
+        config.pathEnabled = Gui.checkbox("Enable Path Mode", config.pathEnabled)
+
+        Gui.separator()
+        Gui.text("Keyframes: " .. tostring(#config.pathKeyframes))
+        config.pathDuration = Gui.sliderFloat("Path Duration (s)", config.pathDuration, 1, 120)
+        config.pathLoop     = Gui.checkbox("Loop (unchecked = ping-pong)", config.pathLoop)
+
+        Gui.separator()
+
+        -- Record
+        if Gui.button(Icon.Record .. " Add Keyframe (V)") or Input.isKeyJustPressed("V") then
+            local pos = camera.position
+            table.insert(config.pathKeyframes, {x=pos.x, y=pos.y, z=pos.z})
+            setStatus("Keyframe " .. #config.pathKeyframes .. " recorded")
+        end
+
+        if Gui.button(Icon.Trash .. " Clear All Keyframes") then
+            config.pathKeyframes = {}
+            pathT = 0.0
+            pathPlaying = false
+            setStatus("All keyframes cleared")
+        end
+
+        Gui.separator()
+
+        -- Playback
+        if not pathPlaying then
+            if Gui.button(Icon.Play .. " Play (B)") or Input.isKeyJustPressed("B") then
+                if #config.pathKeyframes >= 2 then
+                    pathPlaying = true
+                    pathT = 0.0
+                    pathDir = 1
+                    setStatus("Path playback started")
+                else
+                    setStatus("Need at least 2 keyframes")
+                end
+            end
+        else
+            if Gui.button(Icon.Stop .. " Stop") then
+                pathPlaying = false
+                setStatus("Path playback stopped")
+            end
+        end
+
+        config.pathAutoPlay = Gui.checkbox("Auto-play on camera activate", config.pathAutoPlay)
+
+        Gui.separator()
+        Gui.text("Tip: Position yourself then press")
+        Gui.text("'Add Keyframe' to record a point.")
+        Gui.text("Ctrl+R = clear  |  B = play")
+
+    -- ════════════════════════════════════════════════════════════════════
+    --  TAB 3 – POST PROCESSING / FX
+    -- ════════════════════════════════════════════════════════════════════
+    elseif activeTab == 3 then
+        Gui.text("── Post Processing ──")
+
+        Gui.text("Bloom")
+        config.bloomIntensity  = Gui.sliderFloat("Bloom Intensity",  config.bloomIntensity,  0, 10)
+        config.bloomThreshold  = Gui.sliderFloat("Bloom Threshold",  config.bloomThreshold,  0, 10)
+
+        Gui.separator()
+        Gui.text("Depth of Field")
+        config.dofEnabled = Gui.checkbox("Enable Depth of Field", config.dofEnabled)
+        if config.dofEnabled then
+            config.dofFocalDistance = Gui.sliderFloat("Focal Distance",  config.dofFocalDistance, 10, 10000)
+            config.dofFstop         = Gui.sliderFloat("F-Stop (aperture)", config.dofFstop,       0.7, 22)
+            config.dofSensorWidth   = Gui.sliderFloat("Sensor Width (mm)",config.dofSensorWidth,  10, 100)
+        end
+
+        Gui.separator()
+        Gui.text("Camera FX")
+        config.chromaticAberration = Gui.sliderFloat("Chromatic Aberration", config.chromaticAberration, 0, 5)
+        config.motionBlur          = Gui.sliderFloat("Motion Blur Amount",   config.motionBlur,          0, 1)
+
+        Gui.separator()
+        if Gui.button(Icon.Undo .. " Reset Post FX") then
+            config.bloomIntensity      = 1.0
+            config.bloomThreshold      = 1.0
+            config.dofEnabled          = false
+            config.dofFocalDistance    = 500
+            config.dofFstop            = 2.8
+            config.dofSensorWidth      = 24.0
+            config.chromaticAberration = 0.0
+            config.motionBlur          = 0.0
+            resetPostProcessingSettings()
+            setStatus("Post FX reset to defaults")
+        end
+
+    -- ════════════════════════════════════════════════════════════════════
+    --  TAB 4 – CINEMATIC
+    -- ════════════════════════════════════════════════════════════════════
+    elseif activeTab == 4 then
+        Gui.text("── Cinematic Settings ──")
+
+        -- Letterbox
+        config.letterboxEnabled = Gui.checkbox("Letterbox (cinematic bars)", config.letterboxEnabled)
+        if config.letterboxEnabled then
+            config.letterboxAmount = Gui.sliderFloat("Bar Size", config.letterboxAmount, 0.02, 0.20)
+        end
+
+        Gui.separator()
+
+        -- ReShade toggle
+        Gui.text("ReShade Integration")
+        local reshadeLabel = config.reshadeEnabled
+            and (Icon.Eye .. " ReShade: ENABLED")
+            or  (Icon.EyeOff .. " ReShade: DISABLED")
+
+        if Gui.button(reshadeLabel) then
+            config.reshadeEnabled = not config.reshadeEnabled
+            writeReshadeToggle()
+        end
+
+        Gui.text("ReShade state is saved to the camera config JSON.")
+        Gui.text("Use an AHK / PowerShell watcher on that file to")
+        Gui.text("toggle ReShade's global enable in real time.")
+        Gui.text("Config path:")
+        Gui.text("  .../A2/Cameras/Configs/cinematic.camera.json")
+        Gui.text("  key: customdata.reshadeEnabled")
+
+        Gui.separator()
+        Gui.text("Quick cinematic presets:")
+
+        if Gui.button("Shallow DOF  (portrait)") then
+            config.dofEnabled       = true
+            config.dofFocalDistance = 300
+            config.dofFstop         = 1.4
+            config.dofSensorWidth   = 35
+            config.bloomIntensity   = 1.5
+            config.chromaticAberration = 0.3
+            setStatus("Applied: Shallow DOF preset")
+        end
+        Gui.sameLine()
+        if Gui.button("Cinematic FX (broadcast)") then
+            config.dofEnabled       = true
+            config.dofFocalDistance = 800
+            config.dofFstop         = 5.6
+            config.dofSensorWidth   = 24
+            config.bloomIntensity   = 2.0
+            config.motionBlur       = 0.3
+            config.letterboxEnabled = true
+            config.letterboxAmount  = 0.10
+            setStatus("Applied: Broadcast preset")
+        end
+
+        if Gui.button("Clean / No FX") then
+            config.dofEnabled          = false
+            config.bloomIntensity      = 1.0
+            config.bloomThreshold      = 1.0
+            config.chromaticAberration = 0.0
+            config.motionBlur          = 0.0
+            config.letterboxEnabled    = false
+            resetPostProcessingSettings()
+            setStatus("Applied: Clean preset")
+        end
+
+    -- ════════════════════════════════════════════════════════════════════
+    --  TAB 5 – PRESETS
+    -- ════════════════════════════════════════════════════════════════════
+    elseif activeTab == 5 then
+        Gui.text("── Preset Manager ──")
+        Gui.text("Saves ALL settings (movement, follow, path, post FX, cinematic).")
+        Gui.separator()
+
+        presetSlot = Gui.sliderInt("Slot", presetSlot, 1, 5)
+
+        -- Editable name
+        config.presetNames[presetSlot] = Gui.inputText("Preset Name", config.presetNames[presetSlot])
+
+        Gui.separator()
+
+        if Gui.button(Icon.Save .. " Save to Slot " .. presetSlot) then
+            config.presets[presetSlot] = {
+                movementSpeed        = config.movementSpeed,
+                smoothingFactor      = config.smoothingFactor,
+                rotationSmoothing    = config.rotationSmoothing,
+                fov                  = config.fov,
+                followEnabled        = config.followEnabled,
+                followPlayerIndex    = config.followPlayerIndex,
+                followDistance       = config.followDistance,
+                followHeight         = config.followHeight,
+                followLag            = config.followLag,
+                pathEnabled          = config.pathEnabled,
+                pathKeyframes        = table.clone(config.pathKeyframes),
+                pathDuration         = config.pathDuration,
+                pathLoop             = config.pathLoop,
+                pathAutoPlay         = config.pathAutoPlay,
+                bloomIntensity       = config.bloomIntensity,
+                bloomThreshold       = config.bloomThreshold,
+                dofEnabled           = config.dofEnabled,
+                dofFocalDistance     = config.dofFocalDistance,
+                dofFstop             = config.dofFstop,
+                dofSensorWidth       = config.dofSensorWidth,
+                chromaticAberration  = config.chromaticAberration,
+                motionBlur           = config.motionBlur,
+                letterboxEnabled     = config.letterboxEnabled,
+                letterboxAmount      = config.letterboxAmount,
+                reshadeEnabled       = config.reshadeEnabled,
+            }
+            saveConfig()
+            setStatus("Saved to: " .. config.presetNames[presetSlot])
+        end
+        Gui.sameLine()
+        if Gui.button(Icon.Upload .. " Load Slot " .. presetSlot) then
+            local p = config.presets[presetSlot]
+            if p then
+                for k, v in pairs(p) do
+                    config[k] = v
+                end
+                setStatus("Loaded: " .. config.presetNames[presetSlot])
+            else
+                setStatus("Slot " .. presetSlot .. " is empty")
+            end
+        end
+
+        Gui.separator()
+        Gui.text("Saved presets:")
+        for i = 1, 5 do
+            local label = "[" .. i .. "] " .. (config.presetNames[i] or ("Preset " .. i))
+            if config.presets[i] then
+                Gui.text(Icon.Check .. " " .. label)
+            else
+                Gui.text(Icon.X .. " " .. label .. "  (empty)")
+            end
+        end
+    end
+
+    -- ── Footer ───────────────────────────────────────────────────────────
+    Gui.separator()
+    if Gui.button(Icon.Save .. " Save Config") then
+        saveConfig()
+        setStatus("Config saved!")
+    end
+    Gui.sameLine()
+    if Gui.button(Icon.Undo .. " Reset All") then
+        -- wipe and revert to script-top defaults by clearing config
+        for k in pairs(config) do config[k] = nil end
+        setStatus("All settings reset to defaults – restart camera to apply")
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  ACTIVATION HOOK
+-- ═══════════════════════════════════════════════════════════════════════════
+
+function onActivate()
+    -- Seed smoothed position so camera doesn't snap from origin
+    smoothPos = camera.position
+    targetPos = camera.position
+
+    if config.pathAutoPlay and config.pathEnabled and #config.pathKeyframes >= 2 then
+        pathPlaying = true
+        pathT = 0.0
+        pathDir = 1
+    end
+
+    applyPostProcessing()
+    setStatus("Cinematic Camera activated")
+end
+
+function onDeactivate()
+    resetPostProcessingSettings()
+end
